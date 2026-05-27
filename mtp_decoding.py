@@ -1,27 +1,21 @@
-"""The heart of the benchmark: load an MTP model and decode with it three ways.
+"""The heart of the benchmark: load a model and decode with it three ways.
 
-Read this top-to-bottom — it is deliberately written as plain greedy loops with
-no KV-cache tricks so the difference between the three modes is obvious.
+All three modes share ONE runtime (Hugging Face transformers) and ONE KV cache
+strategy, so their throughput numbers are directly comparable.
 
-The key idea
-------------
-A multi-token-prediction (MTP) model can cheaply guess the next K tokens at once
-(its "heads"). We capture that ability behind ONE function:
+  standard     plain greedy, one token per (cached) target pass.
+  speculative  draft proposes a block, the target VERIFIES it in one pass and
+               keeps the matching prefix -> output identical to `standard`.
+  parallel     draft fills a block that is ACCEPTED without verification.
 
-    propose(ids, k) -> list of k guessed token ids
-
-The three execution modes differ only in what they do with those guesses:
-
-  standard     ignore extra heads, take 1 token per target pass.
-  speculative  take k guesses, VERIFY with one target pass, keep matching prefix.
-  parallel     take k guesses, accept ALL of them, never verify.
-
-Substitution note
-------------------
-We emulate the MTP heads with a small, fast *draft* model (DraftProposer). To run
-the real thing instead, implement `Proposer.propose` to read your model's native
-MTP heads (one forward, k logits) and pass that proposer in — the decode loops
-below do not change at all.
+Why the cache is handled differently per mode
+----------------------------------------------
+`standard` and `parallel` only ever *append* tokens, so an append-only KV cache
+is exactly right and works even on Qwen3.5's hybrid (linear + full attention)
+cache. `speculative` must *roll the cache back* whenever a drafted token is
+rejected; doing that correctly on a hybrid cache is subtle, so we delegate it to
+transformers' built-in assisted generation, which is the same lossless
+algorithm. Everything still runs on the same model object.
 """
 from __future__ import annotations
 
@@ -75,177 +69,151 @@ def load_model(repo: str, draft_repo: str, dtype: str, device: str) -> LoadedMod
 
 
 # ---------------------------------------------------------------------------
-# The proposer (stand-in for MTP heads)
+# Small helpers
 # ---------------------------------------------------------------------------
-class DraftProposer:
-    """Guesses the next k tokens by running the small draft model k times.
-
-    This plays the role of an MTP model's K extra heads. A real MTP model would
-    return all k guesses from a *single* forward pass; functionally the decode
-    loops treat both the same way.
-    """
-
-    def __init__(self, draft_model, device):
-        self.model = draft_model
-        self.device = device
-
-    @torch.no_grad()
-    def propose(self, ids: torch.Tensor, k: int) -> list[int]:
-        guesses = []
-        cur = ids
-        for _ in range(k):
-            logits = self.model(cur).logits[:, -1, :]
-            tok = int(logits.argmax(-1))
-            guesses.append(tok)
-            cur = torch.cat([cur, torch.tensor([[tok]], device=self.device)], dim=1)
-        return guesses
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def _target_next_token(target, ids: torch.Tensor) -> int:
-    """Greedy next token according to the *target* model."""
-    logits = target(ids).logits[:, -1, :]
-    return int(logits.argmax(-1))
-
-
-def _cat(ids: torch.Tensor, tok: int, device) -> torch.Tensor:
-    return torch.cat([ids, torch.tensor([[tok]], device=device)], dim=1)
-
-
 @dataclass
 class DecodeResult:
     text: str
     new_tokens: int        # how many tokens we generated
-    target_passes: int     # forward passes through the expensive target model
+    target_passes: int     # target forward passes (-1 if not tracked)
     seconds: float
 
 
+def _eos_ids(lm: LoadedModel) -> set:
+    """All end-of-sequence ids (Qwen uses several, e.g. <|im_end|>)."""
+    ids = set()
+    gc = getattr(lm.target, "generation_config", None)
+    e = getattr(gc, "eos_token_id", None) if gc is not None else None
+    if isinstance(e, int):
+        ids.add(e)
+    elif isinstance(e, (list, tuple)):
+        ids.update(e)
+    if lm.tokenizer.eos_token_id is not None:
+        ids.add(lm.tokenizer.eos_token_id)
+    return ids
+
+
+@torch.no_grad()
+def _step(model, input_ids, past):
+    """One cached forward pass. Returns (last-position logits, new cache)."""
+    out = model(input_ids, past_key_values=past, use_cache=True)
+    return out.logits[:, -1, :], out.past_key_values
+
+
+def _finish(lm, tokens, eos_ids, passes, t0):
+    if any(t in eos_ids for t in tokens):
+        cut = next(i for i, t in enumerate(tokens) if t in eos_ids)
+        tokens = tokens[:cut + 1]
+    text = lm.tokenizer.decode(tokens, skip_special_tokens=True)
+    return DecodeResult(text, len(tokens), passes, time.perf_counter() - t0)
+
+
 # ---------------------------------------------------------------------------
-# Mode 1: standard greedy decoding
+# Mode 1: standard greedy decoding (append-only KV cache)
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def decode_standard(lm: LoadedModel, ids: torch.Tensor, max_new: int) -> DecodeResult:
-    eos = lm.tokenizer.eos_token_id
-    start_len = ids.shape[1]
-    passes = 0
+    eos_ids = _eos_ids(lm)
     t0 = time.perf_counter()
+    logits, past = _step(lm.target, ids, None)   # prefill the prompt
+    passes = 1
+    tokens = []
     for _ in range(max_new):
-        tok = _target_next_token(lm.target, ids)
-        passes += 1
-        ids = _cat(ids, tok, lm.device)
-        if tok == eos:
+        tok = int(logits.argmax(-1))
+        tokens.append(tok)
+        if tok in eos_ids:
             break
-    dt = time.perf_counter() - t0
-    new = ids.shape[1] - start_len
-    text = lm.tokenizer.decode(ids[0, start_len:], skip_special_tokens=True)
-    return DecodeResult(text, new, passes, dt)
+        nxt = torch.tensor([[tok]], device=lm.device)
+        logits, past = _step(lm.target, nxt, past)
+        passes += 1
+    return _finish(lm, tokens, eos_ids, passes, t0)
 
 
 # ---------------------------------------------------------------------------
-# Mode 2: verified speculative decoding (lossless, faster)
+# Mode 2: verified speculative decoding (lossless) via HF assisted generation
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def decode_speculative(lm: LoadedModel, proposer: DraftProposer,
-                       ids: torch.Tensor, max_new: int, k: int) -> DecodeResult:
-    eos = lm.tokenizer.eos_token_id
-    start_len = ids.shape[1]
-    passes = 0
+def decode_speculative(lm: LoadedModel, ids: torch.Tensor, max_new: int,
+                       k: int) -> DecodeResult:
+    eos_ids = _eos_ids(lm)
+    # Ask the assistant (draft) to propose ~k tokens per verification step.
+    try:
+        gc = lm.draft.generation_config
+        gc.num_assistant_tokens = k
+        gc.num_assistant_tokens_schedule = "constant"
+    except Exception:
+        pass
+
     t0 = time.perf_counter()
-
-    while ids.shape[1] - start_len < max_new:
-        # 1) draft proposes k tokens.
-        draft_toks = proposer.propose(ids, k)
-        candidate = ids
-        for t in draft_toks:
-            candidate = _cat(candidate, t, lm.device)
-
-        # 2) ONE target pass scores every draft position in parallel.
-        logits = lm.target(candidate).logits  # (1, len, vocab)
-        passes += 1
-        # Target's own greedy token at each draft position, PLUS the token that
-        # follows the last draft (k+1 predictions total). The extra one is the
-        # free "bonus" token used when every draft is accepted.
-        anchor = ids.shape[1] - 1
-        target_preds = logits[0, anchor:anchor + k + 1, :].argmax(-1).tolist()
-
-        # 3) accept the longest prefix where draft agrees with target.
-        accepted = 0
-        for d, t in zip(draft_toks, target_preds[:k]):
-            if d == t:
-                accepted += 1
-            else:
-                break
-
-        for t in draft_toks[:accepted]:
-            ids = _cat(ids, t, lm.device)
-        # 4) target_preds[accepted] is the correction at the first mismatch, or
-        #    -- when all k were accepted -- the genuine next token. Always free.
-        ids = _cat(ids, target_preds[accepted], lm.device)
-
-        if eos in ids[0, start_len:].tolist():
-            break
-
+    out = lm.target.generate(
+        ids, assistant_model=lm.draft, do_sample=False,
+        max_new_tokens=max_new, pad_token_id=lm.tokenizer.pad_token_id)
     dt = time.perf_counter() - t0
-    # trim anything generated past an eos
-    seq = ids[0, start_len:].tolist()
-    if eos in seq:
-        seq = seq[:seq.index(eos) + 1]
-    new = len(seq)
-    text = lm.tokenizer.decode(seq, skip_special_tokens=True)
-    return DecodeResult(text, new, passes, dt)
+
+    tokens = out[0, ids.shape[1]:].tolist()
+    res = _finish(lm, tokens, eos_ids, passes=-1, t0=t0)
+    return DecodeResult(res.text, res.new_tokens, -1, dt)  # passes not tracked
 
 
 # ---------------------------------------------------------------------------
 # Mode 3: non-verification parallel decoding (fastest, lossy)
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def decode_parallel(lm: LoadedModel, proposer: DraftProposer,
-                    ids: torch.Tensor, max_new: int, k: int) -> DecodeResult:
-    eos = lm.tokenizer.eos_token_id
-    start_len = ids.shape[1]
-    passes = 0
+def decode_parallel(lm: LoadedModel, ids: torch.Tensor, max_new: int,
+                    k: int) -> DecodeResult:
+    """Each block = one strong target token (the anchor / "head 0") followed by
+    k-1 cheap draft tokens accepted blindly. Both models keep their own
+    append-only cache; the target's is advanced over the whole block at once."""
+    eos_ids = _eos_ids(lm)
     t0 = time.perf_counter()
 
-    while ids.shape[1] - start_len < max_new:
-        # Anchor token from the strong target (this is "head 0"); one pass.
-        anchor_tok = _target_next_token(lm.target, ids)
-        passes += 1
-        ids = _cat(ids, anchor_tok, lm.device)
-        if anchor_tok == eos:
+    t_logits, t_past = _step(lm.target, ids, None)   # prefill target
+    _, d_past = _step(lm.draft, ids, None)           # prefill draft
+    passes = 1
+    tokens = []
+    stop = False
+
+    while len(tokens) < max_new and not stop:
+        anchor = int(t_logits.argmax(-1))            # strong token from target
+        tokens.append(anchor)
+        block = [anchor]
+        if anchor in eos_ids:
             break
 
-        # Fill the rest of the block from the cheap heads -- accepted blindly.
-        guesses = proposer.propose(ids, k - 1)
-        stop = False
-        for t in guesses:
-            ids = _cat(ids, t, lm.device)
-            if t == eos:
+        # Draft k-1 look-ahead tokens, fed one at a time into the draft cache.
+        cur = anchor
+        for _ in range(k - 1):
+            d_logits, d_past = _step(
+                lm.draft, torch.tensor([[cur]], device=lm.device), d_past)
+            cur = int(d_logits.argmax(-1))
+            tokens.append(cur)
+            block.append(cur)
+            if cur in eos_ids or len(tokens) >= max_new:
                 stop = True
                 break
-        if stop:
-            break
 
-    dt = time.perf_counter() - t0
-    seq = ids[0, start_len:].tolist()
-    if eos in seq:
-        seq = seq[:seq.index(eos) + 1]
-    new = len(seq)
-    text = lm.tokenizer.decode(seq, skip_special_tokens=True)
-    return DecodeResult(text, new, passes, dt)
+        # Catch the draft cache up to the last block token it hasn't consumed.
+        if not stop:
+            _, d_past = _step(
+                lm.draft, torch.tensor([[block[-1]]], device=lm.device), d_past)
+
+        # Advance the target cache over the whole accepted block -> next anchor.
+        block_t = torch.tensor([block], device=lm.device)
+        t_logits, t_past = _step(lm.target, block_t, t_past)
+        passes += 1
+
+    return _finish(lm, tokens, eos_ids, passes, t0)
 
 
 # ---------------------------------------------------------------------------
 # Single entry point used by the benchmark driver
 # ---------------------------------------------------------------------------
-def generate(lm: LoadedModel, proposer: DraftProposer, prompt_ids: torch.Tensor,
-             mode: str, max_new: int, k: int) -> DecodeResult:
+def generate(lm: LoadedModel, prompt_ids: torch.Tensor, mode: str,
+             max_new: int, k: int) -> DecodeResult:
     if mode == "standard":
         return decode_standard(lm, prompt_ids, max_new)
     if mode == "speculative":
-        return decode_speculative(lm, proposer, prompt_ids, max_new, k)
+        return decode_speculative(lm, prompt_ids, max_new, k)
     if mode == "parallel":
-        return decode_parallel(lm, proposer, prompt_ids, max_new, k)
+        return decode_parallel(lm, prompt_ids, max_new, k)
     raise ValueError(f"unknown decode mode: {mode}")

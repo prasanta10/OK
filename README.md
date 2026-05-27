@@ -49,6 +49,39 @@ python benchmark.py --models Qwen3.5-9B --tasks gsm8k --modes standard parallel
 
 Results print as a table and are saved to `results/results.json`.
 
+### Full experiment — 1000 samples per dataset
+
+This runs the complete matrix (2 models × 3 modes × 4 datasets) with 1000
+examples per dataset and HumanEval code execution enabled:
+
+```bash
+python benchmark.py --limit 1000 --allow-code-exec --results-dir results/full
+```
+
+Notes:
+- `--limit 1000` is an upper bound; datasets smaller than that use all of their
+  examples (HumanEval has 164, ARC-Challenge ~1172, GSM8K test ~1319; MMLU is
+  large so the first 1000 of its test split are used — selection is the first-N,
+  deterministic, not a random sample).
+- `--allow-code-exec` executes model-generated Python to score HumanEval — only
+  run it inside a container/VM (see caveat 4 below). Drop the flag to skip
+  HumanEval scoring (it will report `N/A`).
+- This is a long run (thousands of generations on a 9B model). Launch it
+  detached and log to a file so it survives a closed terminal:
+
+```bash
+nohup python benchmark.py --limit 1000 --allow-code-exec \
+    --results-dir results/full > results_full.log 2>&1 &
+tail -f results_full.log          # watch progress; Ctrl-C only stops tailing
+```
+
+To split the work (e.g. run each model separately to checkpoint progress):
+
+```bash
+python benchmark.py --limit 1000 --models Qwen3.5-9B --allow-code-exec --results-dir results/9b
+python benchmark.py --limit 1000 --models Qwen3.5-4B --allow-code-exec --results-dir results/4b
+```
+
 ## File map
 
 | File | Role |

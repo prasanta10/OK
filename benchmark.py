@@ -59,7 +59,7 @@ def parse_args() -> config.RunConfig:
     return rc
 
 
-def run_one_combo(lm, proposer, task, mode, rc, is_code) -> dict:
+def run_one_combo(lm, task, mode, rc, is_code) -> dict:
     """Evaluate one (model, task, mode) cell of the matrix."""
     examples = task.examples(rc.limit)
     budget = rc.code_max_new_tokens if is_code else rc.max_new_tokens
@@ -69,7 +69,7 @@ def run_one_combo(lm, proposer, task, mode, rc, is_code) -> dict:
 
     for i, ex in enumerate(examples):
         ids = lm.tokenizer(ex["prompt"], return_tensors="pt").input_ids.to(lm.device)
-        res = mtp.generate(lm, proposer, ids, mode, budget, config.SPECULATION_K)
+        res = mtp.generate(lm, ids, mode, budget, config.SPECULATION_K)
 
         total_tokens += res.new_tokens
         total_seconds += res.seconds
@@ -104,7 +104,6 @@ def main():
     for mspec in rc.models:
         print(f"\n=== Loading {mspec.name} ({mspec.repo}) ===")
         lm = mtp.load_model(mspec.repo, mspec.draft_repo, rc.dtype, rc.device)
-        proposer = mtp.DraftProposer(lm.draft, lm.device)
 
         for tspec in rc.tasks:
             task = dt.build_task(tspec, lm.tokenizer, rc.allow_code_exec)
@@ -113,7 +112,7 @@ def main():
                 print(f"  [{mspec.name} | {tspec.name:9s} | {mode:11s}] running...",
                       flush=True)
                 t0 = time.perf_counter()
-                stats = run_one_combo(lm, proposer, task, mode, rc, is_code)
+                stats = run_one_combo(lm, task, mode, rc, is_code)
                 stats.update(model=mspec.name, task=tspec.name, mode=mode,
                              wall_seconds=round(time.perf_counter() - t0, 1))
                 results.append(stats)
@@ -121,7 +120,7 @@ def main():
                 print(f"      acc={acc}  throughput={stats['throughput_tok_s']} tok/s")
 
         # free GPU memory before the next model
-        del lm, proposer
+        del lm
         torch.cuda.empty_cache()
 
     save_and_report(results, rc)

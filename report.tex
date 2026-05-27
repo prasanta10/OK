@@ -59,9 +59,9 @@ explain why the two models named in the original brief
 transformers-format models, and we give a detailed technical justification for
 emulating the MTP heads with a small \emph{draft model} rather than driving the
 target model's native NEXTN heads. The accompanying code is intentionally
-simple---plain greedy decode loops behind a single \texttt{propose($\cdot$)}
-abstraction---so that the only thing that changes between the three regimes is
-how proposed tokens are accepted.
+simple---short, KV-cached greedy decode loops on a single shared runtime---so
+that the only thing that changes between the three regimes is whether (and how)
+proposed tokens are verified before being accepted.
 \end{abstract}
 
 \tableofcontents
@@ -195,7 +195,8 @@ To keep the study runnable, license-free, and inside one runtime, we substitute
 two openly loadable, transformers-format models from the same family
 (\texttt{Qwen/Qwen3.5-9B} and \texttt{Qwen/Qwen3.5-4B}). Using one family is
 deliberate: a \emph{shared tokenizer} lets a single small draft model
-(\texttt{Qwen/Qwen3.5-0.6B}) act as the proposer for both targets. The model
+(\texttt{Qwen/Qwen3.5-0.8B}, the smallest Qwen3.5 release) act as the proposer
+for both targets. The model
 identifiers are isolated in \texttt{config.py} so a genuinely distinct
 architecture can be swapped into either slot. (Exact repository names should be
 confirmed with \texttt{huggingface-cli}, as release names evolve.)
@@ -270,9 +271,11 @@ and works for any pair of tokenizer-compatible models. It cannot silently
 produce wrong physics.
 
 \subsection{Design that keeps the door open}
-The decode loops depend only on a \texttt{propose(ids, k)} call. Replacing the
-draft model with a validated native-NEXTN proposer is a drop-in change that
-leaves the three modes untouched. For trustworthy \emph{native-head} numbers on
+The look-ahead tokens come from a single \texttt{draft} model object that the
+decode loops query in isolation. Replacing that object with a validated
+native-NEXTN proposer (one trunk pass returning $k$ logits) is a localized
+change that leaves the mode logic untouched. For trustworthy \emph{native-head}
+numbers on
 the two verifiable modes (standard and verified speculative), vLLM's
 \texttt{qwen3\_next\_mtp} is the maintained reference; it cannot, however,
 produce the non-verification parallel mode, which is precisely why the
@@ -281,38 +284,60 @@ draft-based custom loop remains necessary for the full study.
 % ===========================================================================
 \section{Methodology}
 % ===========================================================================
-\subsection{One abstraction, three modes}
-All three regimes share a single proposer. The draft proposer returns a block in
-which the first token is the strong target prediction and the remainder come
-from the draft model:
-\begin{lstlisting}[caption={Draft proposer: strong first token, cheap tail.}]
-def propose(self, ids, k):
-    guesses = []
-    cur = ids
-    for _ in range(k):
-        logits = self.model(cur).logits[:, -1, :]   # draft model
-        tok = int(logits.argmax(-1))
-        guesses.append(tok)
-        cur = torch.cat([cur, tok], dim=1)
-    return guesses
-\end{lstlisting}
+\subsection{One runtime, three modes, with KV caching}
+\label{sec:onert}
+All three regimes run on a \emph{single} Hugging Face \texttt{transformers} model
+object and use a key/value (KV) cache, so each step processes only the new
+token(s) against the cached prefix rather than recomputing the whole sequence.
+This is essential for two reasons: throughput becomes linear rather than
+quadratic in the sequence length, and---because every mode shares the same
+runtime and cache strategy---their throughput numbers are \emph{directly
+comparable}, which is the validity requirement for the study's headline
+trade-off.
 
-The modes differ only in how the block is consumed:
-\begin{lstlisting}[caption={Verified speculative acceptance (lossless).}]
-draft_toks = proposer.propose(ids, k)             # cheap block
-logits = target(ids + draft_toks).logits          # ONE target pass
-target_preds = logits[anchor : anchor+k+1].argmax(-1)
-accepted = longest_matching_prefix(draft_toks, target_preds[:k])
-emit(draft_toks[:accepted] + [target_preds[accepted]])  # + free bonus token
+The crucial subtlety is that the modes interact with the cache differently:
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[Standard and parallel --- append-only.] These modes only ever
+        \emph{append} committed tokens; they never reject. An append-only KV
+        cache is therefore exactly correct, and it works even on Qwen3.5's
+        \emph{hybrid} cache (the model interleaves linear-attention and
+        full-attention layers). Both are implemented as short, hand-written
+        cached greedy loops, which keeps the comparison between them
+        apples-to-apples.
+  \item[Verified speculative --- requires rollback.] Whenever a drafted token is
+        rejected, the cache must be \emph{rolled back} to the accepted length.
+        Cropping a hybrid cache (whose linear-attention layers carry a recurrent
+        state rather than a per-token stack) is subtle and easy to get wrong, so
+        we delegate this mode to transformers' built-in \emph{assisted
+        generation}, which implements exactly the lossless verification of
+        \S\ref{sec:modes} and manages the cache internally. It still runs on the
+        same target and draft model objects.
+\end{description}
+
+The standard and parallel loops share the same cached-step primitive:
+\begin{lstlisting}[caption={Standard greedy with an append-only KV cache.}]
+logits, past = step(target, prompt_ids, past=None)   # prefill once
+for _ in range(max_new):
+    tok = int(logits.argmax(-1)); emit(tok)
+    if tok in eos_ids: break
+    logits, past = step(target, [[tok]], past)        # 1 new token / pass
 \end{lstlisting}
-\begin{lstlisting}[caption={Non-verification parallel (lossy).}]
-anchor_tok = target_next_token(ids)   # one strong token, head 0
-emit(anchor_tok)
-guesses = proposer.propose(ids, k-1)  # cheap look-ahead
-emit(guesses)                         # accepted blindly, NO verification
+\begin{lstlisting}[caption={Non-verification parallel (lossy): strong anchor + blind look-ahead.}]
+anchor = int(target_logits.argmax(-1)); emit(anchor)  # strong token (head 0)
+cur = anchor
+for _ in range(k-1):                                  # cheap look-ahead
+    d_logits, d_past = step(draft, [[cur]], d_past)
+    cur = int(d_logits.argmax(-1)); emit(cur)         # accepted, NO verification
+target_logits, t_past = step(target, block, t_past)   # advance target -> next anchor
 \end{lstlisting}
-The loops use full forward passes (no KV cache) for readability; see
-\S\ref{sec:limitations}.
+Verified speculative is invoked in one call:
+\begin{lstlisting}[caption={Verified speculative via HF assisted generation (lossless).}]
+draft.generation_config.num_assistant_tokens = k      # propose ~k tokens / step
+out = target.generate(ids, assistant_model=draft, do_sample=False,
+                      max_new_tokens=max_new)          # cache rollback handled internally
+\end{lstlisting}
+Greedy decoding is used throughout (deterministic), and generation stops on any
+end-of-sequence id (Qwen emits several, e.g.\ \texttt{<|im\_end|>}).
 
 \subsection{Datasets and tasks}
 All four datasets are evaluated \emph{generatively} (the model writes an answer
@@ -325,10 +350,10 @@ in text) so that every decode mode is exercised identically.
 \toprule
 \textbf{Dataset} & \textbf{Domain} & \textbf{Source / split} & \textbf{Scoring} \\
 \midrule
-GSM8K & grade-school math & \texttt{gsm8k/main}, test & exact match on final integer \\
-HumanEval & Python coding & \texttt{openai\_humaneval}, test & unit-test pass@1 (executed) \\
+GSM8K & grade-school math & \texttt{openai/gsm8k/main}, test & exact match on final integer \\
+HumanEval & Python coding & \texttt{openai/openai\_humaneval}, test & unit-test pass@1 (executed) \\
 MMLU & general knowledge & \texttt{cais/mmlu/all}, test & extracted choice letter \\
-ARC & science reasoning & \texttt{ai2\_arc/ARC-Challenge}, test & extracted choice letter \\
+ARC & science reasoning & \texttt{allenai/ai2\_arc/ARC-Challenge}, test & extracted choice letter \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -336,6 +361,11 @@ ARC & science reasoning & \texttt{ai2\_arc/ARC-Challenge}, test & extracted choi
 \paragraph{Prompting.} Each example is wrapped with the model's chat template
 (when present). Math and multiple-choice prompts request a parseable final line
 (``\texttt{Answer: <value>}''); the code prompt requests a fenced Python block.
+Qwen3.5 is a \emph{thinking} model: by default its template opens a long
+\texttt{<think>}\dots\texttt{</think>} chain-of-thought that exhausts the token
+budget before the final answer (yielding spurious zero accuracy). We therefore
+set \texttt{enable\_thinking=False} for evaluation, and answer extraction also
+strips any residual \texttt{<think>} block before parsing.
 
 \paragraph{Answer extraction.} GSM8K: last integer (after \texttt{\#\#\#\#} in the
 gold). MMLU/ARC: an explicit ``Answer: X'' letter, else the last standalone
@@ -350,8 +380,9 @@ generation time on the target model:
 \text{throughput} \;=\; \frac{\sum_i (\text{new tokens})_i}{\sum_i (\text{seconds})_i}
 \quad [\text{tokens/s}].
 \end{equation}
-We also record the number of expensive target forward passes, which is the
-mode-independent driver of the speedup.
+For the hand-written loops (standard, parallel) we also record the number of
+expensive target forward passes, the underlying driver of the speedup; assisted
+generation does not expose this count.
 
 \subsection{Experimental matrix}
 The full sweep is $2\ \text{models} \times 3\ \text{modes} \times 4\
@@ -371,7 +402,7 @@ The full sweep is $2\ \text{models} \times 3\ \text{modes} \times 4\
 \midrule
 \texttt{environment.yml} & Conda environment (Python 3.11, CUDA-13.0 PyTorch, HF stack) \\
 \texttt{config.py}       & All knobs: models, datasets, modes, limits, $K$ \\
-\texttt{mtp\_decoding.py} & Model loading, draft proposer, the three decode loops \\
+\texttt{mtp\_decoding.py} & Model loading and the three KV-cached decode loops \\
 \texttt{datasets\_tasks.py} & Prompt building, answer extraction, scoring \\
 \texttt{benchmark.py}    & Driver: sweeps the matrix, prints and saves results \\
 \bottomrule
@@ -399,6 +430,88 @@ python benchmark.py --limit 100 --allow-code-exec   # full, with code execution
 python benchmark.py --models Qwen3.5-9B --tasks gsm8k --modes standard parallel
 \end{lstlisting}
 Results print as a table and are saved to \texttt{results/results.json}.
+
+% ===========================================================================
+\section{Recommended Experimental Protocol}
+\label{sec:protocol}
+% ===========================================================================
+This section records a concrete plan for running the study, so a later
+experimenter can reproduce or extend it without re-deriving the choices.
+
+\subsection{How many examples per dataset?}
+For a binary accuracy metric the 95\% confidence half-width is approximately
+$1.96\sqrt{p(1-p)/n}$, giving:
+
+\begin{table}[h]
+\centering
+\caption{Accuracy confidence interval versus sample size $n$ (worst case $p\approx0.5$).}
+\begin{tabular}{@{}lc@{}}
+\toprule
+\textbf{$n$ per dataset} & \textbf{95\% CI half-width} \\
+\midrule
+100  & $\pm10\%$ \\
+\textbf{250}  & $\pm6\%$ \\
+500  & $\pm4.4\%$ \\
+1000 & $\pm3.1\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The headline effect---accuracy collapse under non-verification parallel
+decoding---is \emph{large} (a $20$--$50\%$ drop on multi-step reasoning), so it
+is unambiguous already at $n\approx250$. The \texttt{standard} vs.
+\texttt{speculative} comparison needs \emph{no} statistics: speculative is
+lossless, so the two must be identical---this is a correctness check, not a
+measurement. Larger $n$ is only needed to resolve small differences, which is
+not where the signal lies. Greedy decoding is deterministic, so multiple random
+seeds are unnecessary for accuracy. \textbf{Recommended main run: $n=250$.}
+
+\subsection{Coverage}
+Run all four datasets, both models, and all three modes. The datasets are not
+redundant: GSM8K and ARC (multi-step reasoning) should collapse sharply under
+parallel decoding, whereas the multiple-choice framing of MMLU and ARC degrades
+gently---this contrast is itself a result. Keeping both the 4B and 9B models
+exposes the size axis (does the larger model better tolerate unverified
+decoding?).
+
+\subsection{Staged commands}
+\begin{lstlisting}[language=bash,basicstyle=\ttfamily\footnotesize]
+# Stage 0 -- pipeline sanity (minutes): confirm accuracy != 0 and all modes run
+python benchmark.py --limit 1 --models Qwen3.5-9B --tasks gsm8k \
+       --modes standard --debug
+python benchmark.py --limit 20 --results-dir results/smoke
+
+# Stage 1 -- MAIN RUN (the one to report): n=250, detached and logged
+nohup python benchmark.py --limit 250 --allow-code-exec \
+       --results-dir results/main > main.log 2>&1 &
+tail -f main.log
+
+# Stage 2 -- OPTIONAL: tighten reasoning tasks only, for smaller CIs
+python benchmark.py --limit 1000 --models Qwen3.5-9B Qwen3.5-4B \
+       --tasks gsm8k arc --results-dir results/deep
+
+# Full sweep at 1000/dataset (long; HumanEval caps at its 164 problems)
+nohup python benchmark.py --limit 1000 --allow-code-exec \
+       --results-dir results/full > full.log 2>&1 &
+\end{lstlisting}
+\texttt{--limit} is an upper bound (\texttt{min(limit, len(dataset))}); HumanEval
+has 164 problems, ARC-Challenge $\sim$1172, GSM8K test $\sim$1319, and MMLU uses
+the first 1000 of its large test split. \texttt{--allow-code-exec} executes
+model-generated Python for HumanEval and must be run inside a container/VM
+(\S\ref{sec:limitations}); omit it to report HumanEval as \texttt{N/A}.
+
+\subsection{Two checks on the output}
+\begin{enumerate}[nosep]
+  \item \textbf{Lossless gate.} In the results, \texttt{standard} and
+        \texttt{speculative} accuracy must match per (model, dataset). A mismatch
+        means assisted generation is misconfigured---investigate before trusting
+        any number.
+  \item \textbf{Throughput warm-up bias.} The first generation in each cell pays
+        one-time CUDA kernel/graph compilation, inflating its wall time and
+        depressing tokens/s (worst at small $n$). A discarded warm-up generation
+        per cell removes this bias; otherwise read tokens/s as a relative
+        quantity.
+\end{enumerate}
 
 % ===========================================================================
 \section{Expected Outcomes and Hypotheses}
@@ -429,9 +542,16 @@ three points trace out for each model and dataset.
         target's native NEXTN heads (\S\ref{sec:why-draft}). Absolute speedups
         differ from a fused MTP implementation; the \emph{direction} and the
         accuracy trade-off are faithful.
-  \item \textbf{No KV cache.} Decode loops use full forward passes for clarity,
-        so absolute tokens/s is lower than production; \emph{relative} mode
-        comparisons remain valid.
+  \item \textbf{Mixed cached implementations.} Standard and parallel are
+        hand-written append-only cached loops, so their comparison is
+        apples-to-apples. Verified speculative uses transformers' assisted
+        generation (\S\ref{sec:onert}); its per-token Python overhead differs
+        slightly, so its absolute throughput is only broadly comparable---though
+        its \emph{accuracy} is identical to standard by construction, which
+        doubles as a correctness check.
+  \item \textbf{Python-level decoding.} Even with KV caching, the loops run at
+        the Python/eager level, so absolute tokens/s is below a served engine
+        (vLLM/SGLang); \emph{relative} mode comparisons remain valid.
   \item \textbf{Small default \texttt{-{}-limit}.} Statistically meaningful
         accuracy requires raising the example count.
   \item \textbf{Code execution.} \texttt{-{}-allow-code-exec} runs
