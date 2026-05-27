@@ -41,12 +41,15 @@ def parse_args() -> config.RunConfig:
     p.add_argument("--tasks", nargs="*", help="subset by task name")
     p.add_argument("--modes", nargs="*", help="subset of decode modes")
     p.add_argument("--results-dir", default=rc.results_dir)
+    p.add_argument("--debug", action="store_true",
+                   help="print the first prompt + raw generation per cell")
     a = p.parse_args()
 
     rc.limit = a.limit
     rc.max_new_tokens = a.max_new_tokens
     rc.allow_code_exec = a.allow_code_exec
     rc.results_dir = a.results_dir
+    rc.debug = a.debug
     if a.models:
         rc.models = [m for m in config.MODELS if m.name in a.models]
     if a.tasks:
@@ -64,7 +67,7 @@ def run_one_combo(lm, proposer, task, mode, rc, is_code) -> dict:
     correct, scored = 0.0, 0
     total_tokens, total_seconds = 0, 0.0
 
-    for ex in examples:
+    for i, ex in enumerate(examples):
         ids = lm.tokenizer(ex["prompt"], return_tensors="pt").input_ids.to(lm.device)
         res = mtp.generate(lm, proposer, ids, mode, budget, config.SPECULATION_K)
 
@@ -72,6 +75,11 @@ def run_one_combo(lm, proposer, task, mode, rc, is_code) -> dict:
         total_seconds += res.seconds
 
         s = task.score(ex, res.text)
+        if getattr(rc, "debug", False) and i == 0:
+            print("\n      --- DEBUG sample ---")
+            print("      PROMPT:", ex["prompt"][-300:].replace("\n", "\n      "))
+            print("      GENERATION:", res.text[:600].replace("\n", "\n      "))
+            print(f"      gold={ex.get('gold')!r}  score={s}  tokens={res.new_tokens}\n")
         if s is not None:          # None => task skipped (e.g. code exec off)
             correct += s
             scored += 1

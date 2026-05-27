@@ -31,6 +31,11 @@ from dataclasses import dataclass
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:  # VLM fallback class (Qwen3.5 ships as *ForConditionalGeneration)
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # older transformers
+    AutoModelForImageTextToText = None
+
 
 # ---------------------------------------------------------------------------
 # Loading
@@ -43,18 +48,29 @@ class LoadedModel:
     device: str
 
 
+def _load_lm(repo: str, torch_dtype, device):
+    """Load a causal LM, falling back to the image-text-to-text class for the
+    Qwen3.5 *ForConditionalGeneration (VLM) checkpoints. We only ever feed text,
+    so either class exposes the same next-token `.logits`."""
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            repo, torch_dtype=torch_dtype, device_map=device).eval()
+    except (ValueError, KeyError) as e:
+        if AutoModelForImageTextToText is None:
+            raise
+        print(f"    {repo}: not a plain causal LM ({e}); loading as VLM.")
+        return AutoModelForImageTextToText.from_pretrained(
+            repo, torch_dtype=torch_dtype, device_map=device).eval()
+
+
 def load_model(repo: str, draft_repo: str, dtype: str, device: str) -> LoadedModel:
     torch_dtype = getattr(torch, dtype)
     tokenizer = AutoTokenizer.from_pretrained(repo)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    target = AutoModelForCausalLM.from_pretrained(
-        repo, torch_dtype=torch_dtype, device_map=device
-    ).eval()
-    draft = AutoModelForCausalLM.from_pretrained(
-        draft_repo, torch_dtype=torch_dtype, device_map=device
-    ).eval()
+    target = _load_lm(repo, torch_dtype, device)
+    draft = _load_lm(draft_repo, torch_dtype, device)
     return LoadedModel(tokenizer, target, draft, device)
 
 

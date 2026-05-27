@@ -1,0 +1,488 @@
+\documentclass[11pt]{article}
+
+% ---------------------------------------------------------------------------
+% Packages (all standard; compiles with a normal pdflatex install)
+% ---------------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage[hidelinks]{hyperref}
+
+% ---------------------------------------------------------------------------
+% Code listing style
+% ---------------------------------------------------------------------------
+\definecolor{codegray}{rgb}{0.95,0.95,0.95}
+\definecolor{codekw}{rgb}{0.10,0.10,0.60}
+\definecolor{codecmt}{rgb}{0.30,0.55,0.30}
+\definecolor{codestr}{rgb}{0.65,0.20,0.20}
+\lstdefinestyle{py}{
+  language=Python,
+  backgroundcolor=\color{codegray},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecmt}\itshape,
+  stringstyle=\color{codestr},
+  numbers=left, numberstyle=\tiny\color{gray}, numbersep=6pt,
+  breaklines=true, frame=single, framesep=4pt, showstringspaces=false,
+  captionpos=b, xleftmargin=2em,
+}
+\lstset{style=py}
+
+\title{\textbf{Benchmarking Multi-Token-Prediction Models\\
+Across Three Decoding Regimes}\\[4pt]
+\large Standard, Verified Speculative, and Non-Verification Parallel Decoding\\
+on GSM8K, HumanEval, MMLU, and ARC-Challenge}
+
+\author{\textit{Author:} \texttt{<your name>} \\ \textit{Internship Project (TI)}}
+\date{27 May 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents the design and implementation of a benchmark that
+measures how the \emph{verification layer} of multi-token-prediction (MTP)
+decoding trades off generation \emph{throughput} against task \emph{accuracy}.
+We evaluate mid-size language models under three execution modes---standard
+single-token decoding, verified (lossless) speculative decoding, and
+non-verification parallel decoding---across four reasoning benchmarks: GSM8K
+(math), HumanEval (code), MMLU (knowledge), and ARC-Challenge (science). We
+explain why the two models named in the original brief
+(\texttt{facebook/multi-token-prediction} and
+\texttt{unsloth/Qwen3.5-9B-MTP-GGUF}) were substituted with openly loadable
+transformers-format models, and we give a detailed technical justification for
+emulating the MTP heads with a small \emph{draft model} rather than driving the
+target model's native NEXTN heads. The accompanying code is intentionally
+simple---plain greedy decode loops behind a single \texttt{propose($\cdot$)}
+abstraction---so that the only thing that changes between the three regimes is
+how proposed tokens are accepted.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+% ===========================================================================
+\section{Introduction}
+% ===========================================================================
+Large language models normally generate text one token per forward pass. This
+is wasteful: a single forward pass already computes a rich representation, yet
+it commits to only one output token. \emph{Multi-token prediction} (MTP) adds
+auxiliary heads that predict several future tokens from the same pass, and
+\emph{speculative decoding} turns those guesses into speedups by drafting
+several tokens cheaply and then verifying them with the strong model in
+parallel.
+
+The central question of this study is: \textbf{what does the verification step
+buy us, and what does removing it cost?} Verification guarantees that the output
+is identical to ordinary greedy decoding (it is \emph{lossless}), but it caps
+the achievable speedup. If we drop verification and simply accept the cheap
+multi-token guesses, generation is faster still---but errors compound and the
+generated reasoning can lose coherence. We quantify exactly this trade-off.
+
+\paragraph{Objective.} For each (model $\times$ decoding mode $\times$ dataset)
+combination, measure two quantities:
+\begin{itemize}[nosep]
+  \item \textbf{Accuracy} --- task-specific correctness, to locate the point at
+        which unverified text loses logical coherence.
+  \item \textbf{Throughput} --- generated tokens per second, to quantify the
+        speedup gained by optimizing or removing the verification layer.
+\end{itemize}
+
+\paragraph{Contributions of this work.}
+\begin{enumerate}[nosep]
+  \item A small, readable benchmark harness that runs the same models under
+        three decoding regimes and four datasets.
+  \item A documented account of the practical gap between the \emph{specified}
+        models and what is actually loadable, and the substitutions made.
+  \item A reasoned methodological decision to emulate MTP heads with a draft
+        model, with the supporting evidence and risk analysis.
+\end{enumerate}
+
+% ===========================================================================
+\section{Background}
+% ===========================================================================
+\subsection{Multi-token prediction (MTP)}
+A standard causal LM with parameters $\theta$ models
+$p_\theta(x_{t+1}\mid x_{\le t})$ and emits one token per step. An MTP model adds
+$K$ extra heads so that a single pass over context $x_{\le t}$ produces
+predictions for $x_{t+1},x_{t+2},\dots,x_{t+K}$. Head $0$ is the ordinary
+next-token head (strong); heads $1\dots K{-}1$ are cheaper look-ahead heads.
+This is the design of the Meta MTP models~\cite{gloeckle2024} and the NEXTN
+modules in DeepSeek-V3~\cite{deepseekv3} and recent Qwen releases.
+
+\subsection{Speculative decoding and verification}
+Speculative decoding~\cite{leviathan2023,chen2023} accelerates generation
+without changing its output distribution. A cheap \emph{drafter} proposes a
+block of $K$ tokens; the expensive \emph{target} model then scores all $K$
+positions in \emph{one} parallel forward pass. Under greedy decoding the
+acceptance rule is simply: keep the longest prefix of drafted tokens that equals
+the target's own greedy token at each position, then append one free
+``bonus'' correction token. Formally, with drafted tokens $d_1,\dots,d_K$ and
+target greedy tokens $g_1,\dots,g_K$ at the same positions, the number accepted
+is
+\begin{equation}
+a \;=\; \max\Big\{\, j : d_i = g_i \ \text{for all } i \le j \,\Big\},
+\end{equation}
+and we emit $d_1,\dots,d_a$ followed by the bonus token $g_{a+1}$. Because every
+emitted token agrees with the target's greedy choice, the result is
+\textbf{token-for-token identical} to standard greedy decoding---verification is
+lossless. The speedup comes from emitting up to $a{+}1$ tokens per target pass
+instead of one.
+
+\subsection{The three execution modes under study}
+\label{sec:modes}
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[Standard.] Plain greedy decoding: one target forward pass per token.
+        The accuracy and (slow) throughput baseline.
+  \item[Verified speculative.] Propose $K$, verify in one target pass, accept
+        the matching prefix plus bonus token. \emph{Same accuracy as standard}
+        (lossless); higher throughput.
+  \item[Non-verification parallel.] Propose $K$ and accept \emph{all} of them
+        with no verification. Highest throughput, but the target never corrects
+        the cheap guesses, so errors accumulate. This is the mode whose accuracy
+        we expect to degrade---most on multi-step reasoning where early mistakes
+        propagate.
+\end{description}
+
+% ===========================================================================
+\section{Models: Specification versus Reality}
+% ===========================================================================
+\subsection{The originally specified models}
+The brief named two models:
+\begin{enumerate}[nosep]
+  \item \texttt{facebook/multi-token-prediction} (7B), the research artifact for
+        the Meta MTP paper~\cite{gloeckle2024}.
+  \item \texttt{unsloth/Qwen3.5-9B-MTP-GGUF} (9B), a quantized MTP release.
+\end{enumerate}
+
+\subsection{Practical obstacles}
+Inspecting the published artifacts revealed that neither is directly usable in a
+simple \texttt{transformers} script:
+
+\begin{table}[h]
+\centering
+\caption{Why the specified models are not drop-in loadable.}
+\begin{tabular}{@{}p{3.6cm}p{4.0cm}p{4.6cm}@{}}
+\toprule
+\textbf{Model} & \textbf{Format / runtime} & \textbf{Obstacle} \\
+\midrule
+\texttt{facebook/multi-token-prediction} &
+PyTorch state-dicts in Llama-2 format; custom \texttt{example\_completion.py}
+launched via \texttt{torchrun} &
+\emph{Gated} (must accept Meta's research licence); not loadable through
+\texttt{AutoModelForCausalLM}; needs Meta's bespoke code. \\
+\addlinespace
+\texttt{unsloth/Qwen3.5-9B-MTP-GGUF} &
+GGUF quantization for \texttt{llama.cpp} &
+Not a \texttt{transformers} model; MTP runs only via \texttt{llama.cpp}'s
+\texttt{-{}-spec-type draft-mtp}. A different runtime entirely. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Crucially, the two live in \emph{incompatible runtimes} (a custom Meta codebase
+versus \texttt{llama.cpp}), so a single uniform benchmark cannot load both as
+written.
+
+\subsection{Substitution decision}
+To keep the study runnable, license-free, and inside one runtime, we substitute
+two openly loadable, transformers-format models from the same family
+(\texttt{Qwen/Qwen3.5-9B} and \texttt{Qwen/Qwen3.5-4B}). Using one family is
+deliberate: a \emph{shared tokenizer} lets a single small draft model
+(\texttt{Qwen/Qwen3.5-0.6B}) act as the proposer for both targets. The model
+identifiers are isolated in \texttt{config.py} so a genuinely distinct
+architecture can be swapped into either slot. (Exact repository names should be
+confirmed with \texttt{huggingface-cli}, as release names evolve.)
+
+% ===========================================================================
+\section{Why a Draft Model Instead of Native MTP Heads}
+\label{sec:why-draft}
+% ===========================================================================
+This is the most important methodological decision in the study, so we justify
+it in detail.
+
+\subsection{The native heads exist}
+Inspecting \texttt{Qwen/Qwen3.5-4B} confirms a real MTP module is present. Its
+\texttt{config.json} declares \texttt{mtp\_num\_hidden\_layers: 1}, and the
+checkpoint contains a complete NEXTN-style head:
+\begin{lstlisting}[language=bash,basicstyle=\ttfamily\footnotesize]
+mtp.layers.0.self_attn.{q,k,v,o}_proj.weight   mtp.layers.0.mlp.*
+mtp.fc.weight        mtp.norm.weight
+mtp.pre_fc_norm_hidden.weight   mtp.pre_fc_norm_embedding.weight
+\end{lstlisting}
+This is the DeepSeek-V3 NEXTN recipe~\cite{deepseekv3}: fuse the trunk's hidden
+state $h$ with the embedding of the just-predicted token $e$, project, run one
+extra transformer layer, and reuse the tied LM head:
+\begin{equation}
+\label{eq:nextn}
+x \,=\, W_{\text{fc}}\,\big[\,\mathrm{RMSNorm}_h(h)\,;\,\mathrm{RMSNorm}_e(e)\,\big],
+\quad
+h' \,=\, \mathrm{Layer}(x),
+\quad
+\hat{t} \,=\, \arg\max\;\mathrm{LMHead}\big(\mathrm{RMSNorm}(h')\big).
+\end{equation}
+So in principle the native heads \emph{are} the drafter and a separate model is
+unnecessary.
+
+\subsection{Why we nonetheless use a draft model}
+Four reasons, in order of importance:
+
+\paragraph{(1) \texttt{transformers} does not run the heads by default.}
+The model class (\texttt{Qwen3\_5ForConditionalGeneration}) \emph{loads} the
+\texttt{mtp.*} weights but does not invoke them during \texttt{generate()}. The
+NEXTN module is driven only by serving frameworks---vLLM
+(\texttt{qwen3\_next\_mtp}), SGLang (\texttt{NEXTN}), and \texttt{llama.cpp}
+(\texttt{draft-mtp}). Reaching the heads from a plain Python loop requires
+hand-driving the module.
+
+\paragraph{(2) Hand-wiring NEXTN is high-risk and unverifiable offline.}
+Equation~\eqref{eq:nextn} hides several details that must be exactly right: the
+concatenation order inside $W_{\text{fc}}$, the hidden/token alignment shift,
+the rotary-position wiring of the extra attention layer, and the carry of hidden
+state across multi-step roll-out. The target is also a \emph{hybrid linear-attention
+vision-language model}, which complicates the layer's forward signature. A
+subtle error here would be silent: in verified mode it merely lowers the
+acceptance rate (slower, still correct), but in \textbf{non-verification
+parallel mode it directly corrupts the generated tokens---and accuracy is the
+headline metric}. We could not validate the exact wiring without running it on
+the target hardware.
+
+\paragraph{(3) Faithful proxy for the quantity under study.}
+The study measures the \emph{verification trade-off}, not a specific head
+implementation. What matters is having (i) a strong next-token source and (ii) a
+cheaper multi-token look-ahead source whose unverified errors we can observe. A
+small draft model provides exactly this contrast and is a standard, well-understood
+speculative-decoding drafter~\cite{leviathan2023,chen2023}. The three decode
+loops are written against one interface, so the conclusions about
+verification are independent of whether the look-ahead comes from a draft model
+or native heads.
+
+\paragraph{(4) Simplicity and reproducibility.}
+The brief asked for simple code that is easy to understand and certain to run.
+The draft-model proposer is a handful of lines, has no model-specific assumptions,
+and works for any pair of tokenizer-compatible models. It cannot silently
+produce wrong physics.
+
+\subsection{Design that keeps the door open}
+The decode loops depend only on a \texttt{propose(ids, k)} call. Replacing the
+draft model with a validated native-NEXTN proposer is a drop-in change that
+leaves the three modes untouched. For trustworthy \emph{native-head} numbers on
+the two verifiable modes (standard and verified speculative), vLLM's
+\texttt{qwen3\_next\_mtp} is the maintained reference; it cannot, however,
+produce the non-verification parallel mode, which is precisely why the
+draft-based custom loop remains necessary for the full study.
+
+% ===========================================================================
+\section{Methodology}
+% ===========================================================================
+\subsection{One abstraction, three modes}
+All three regimes share a single proposer. The draft proposer returns a block in
+which the first token is the strong target prediction and the remainder come
+from the draft model:
+\begin{lstlisting}[caption={Draft proposer: strong first token, cheap tail.}]
+def propose(self, ids, k):
+    guesses = []
+    cur = ids
+    for _ in range(k):
+        logits = self.model(cur).logits[:, -1, :]   # draft model
+        tok = int(logits.argmax(-1))
+        guesses.append(tok)
+        cur = torch.cat([cur, tok], dim=1)
+    return guesses
+\end{lstlisting}
+
+The modes differ only in how the block is consumed:
+\begin{lstlisting}[caption={Verified speculative acceptance (lossless).}]
+draft_toks = proposer.propose(ids, k)             # cheap block
+logits = target(ids + draft_toks).logits          # ONE target pass
+target_preds = logits[anchor : anchor+k+1].argmax(-1)
+accepted = longest_matching_prefix(draft_toks, target_preds[:k])
+emit(draft_toks[:accepted] + [target_preds[accepted]])  # + free bonus token
+\end{lstlisting}
+\begin{lstlisting}[caption={Non-verification parallel (lossy).}]
+anchor_tok = target_next_token(ids)   # one strong token, head 0
+emit(anchor_tok)
+guesses = proposer.propose(ids, k-1)  # cheap look-ahead
+emit(guesses)                         # accepted blindly, NO verification
+\end{lstlisting}
+The loops use full forward passes (no KV cache) for readability; see
+\S\ref{sec:limitations}.
+
+\subsection{Datasets and tasks}
+All four datasets are evaluated \emph{generatively} (the model writes an answer
+in text) so that every decode mode is exercised identically.
+
+\begin{table}[h]
+\centering
+\caption{Benchmark datasets and scoring.}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Dataset} & \textbf{Domain} & \textbf{Source / split} & \textbf{Scoring} \\
+\midrule
+GSM8K & grade-school math & \texttt{gsm8k/main}, test & exact match on final integer \\
+HumanEval & Python coding & \texttt{openai\_humaneval}, test & unit-test pass@1 (executed) \\
+MMLU & general knowledge & \texttt{cais/mmlu/all}, test & extracted choice letter \\
+ARC & science reasoning & \texttt{ai2\_arc/ARC-Challenge}, test & extracted choice letter \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Prompting.} Each example is wrapped with the model's chat template
+(when present). Math and multiple-choice prompts request a parseable final line
+(``\texttt{Answer: <value>}''); the code prompt requests a fenced Python block.
+
+\paragraph{Answer extraction.} GSM8K: last integer (after \texttt{\#\#\#\#} in the
+gold). MMLU/ARC: an explicit ``Answer: X'' letter, else the last standalone
+A--D. HumanEval: the fenced code block, completed with the signature if needed,
+then executed against the official tests.
+
+\subsection{Metrics}
+\textbf{Accuracy} is the mean task score over the evaluated examples.
+\textbf{Throughput} is total generated tokens divided by total wall-clock
+generation time on the target model:
+\begin{equation}
+\text{throughput} \;=\; \frac{\sum_i (\text{new tokens})_i}{\sum_i (\text{seconds})_i}
+\quad [\text{tokens/s}].
+\end{equation}
+We also record the number of expensive target forward passes, which is the
+mode-independent driver of the speedup.
+
+\subsection{Experimental matrix}
+The full sweep is $2\ \text{models} \times 3\ \text{modes} \times 4\
+\text{datasets} = 24$ cells, each reporting accuracy and throughput. A
+\texttt{-{}-limit} flag caps examples per dataset for fast iteration.
+
+% ===========================================================================
+\section{Implementation}
+% ===========================================================================
+\subsection{Code structure}
+\begin{table}[h]
+\centering
+\caption{Repository layout.}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{File} & \textbf{Responsibility} \\
+\midrule
+\texttt{environment.yml} & Conda environment (Python 3.11, CUDA-13.0 PyTorch, HF stack) \\
+\texttt{config.py}       & All knobs: models, datasets, modes, limits, $K$ \\
+\texttt{mtp\_decoding.py} & Model loading, draft proposer, the three decode loops \\
+\texttt{datasets\_tasks.py} & Prompt building, answer extraction, scoring \\
+\texttt{benchmark.py}    & Driver: sweeps the matrix, prints and saves results \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Environment and hardware}
+Experiments target a single large-memory NVIDIA GPU (128~GB), so both targets
+load in \texttt{bfloat16} without quantization and speculative decoding fits
+comfortably. The environment pins PyTorch built for \textbf{CUDA 13.0}
+(\texttt{cu130}, requiring \texttt{torch>=2.10}). Because the \texttt{cu130}
+wheel index omits a \texttt{cuda-bindings} dependency, the install uses
+\texttt{-{}-extra-index-url} rather than \texttt{-{}-index-url}. CUDA drivers are
+backward compatible, so a 13.0 driver also runs older \texttt{cu128}/\texttt{cu126}
+wheels if needed.
+
+\subsection{Running the benchmark}
+\begin{lstlisting}[language=bash,basicstyle=\ttfamily\footnotesize]
+conda env create -f environment.yml
+conda activate mtp-bench
+huggingface-cli login                 # if any chosen repo is gated
+
+python benchmark.py --limit 10        # quick smoke test
+python benchmark.py --limit 100 --allow-code-exec   # full, with code execution
+python benchmark.py --models Qwen3.5-9B --tasks gsm8k --modes standard parallel
+\end{lstlisting}
+Results print as a table and are saved to \texttt{results/results.json}.
+
+% ===========================================================================
+\section{Expected Outcomes and Hypotheses}
+% ===========================================================================
+\begin{description}[style=nextline,leftmargin=1.5em]
+  \item[H1 (lossless verification).] \texttt{standard} and \texttt{speculative}
+        yield \emph{identical} accuracy on every dataset; \texttt{speculative}
+        is faster.
+  \item[H2 (throughput ordering).] Throughput increases
+        \texttt{standard} $<$ \texttt{speculative} $<$ \texttt{parallel}, since
+        each step removes target work.
+  \item[H3 (coherence collapse).] \texttt{parallel} accuracy falls below the
+        other two, with the largest drop on multi-step reasoning (GSM8K, ARC),
+        because unverified errors compound; single-shot extraction tasks degrade
+        more gently.
+\end{description}
+The study's deliverable is the curve of accuracy versus throughput that these
+three points trace out for each model and dataset.
+
+% ===========================================================================
+\section{Limitations and Threats to Validity}
+\label{sec:limitations}
+% ===========================================================================
+\begin{itemize}[nosep]
+  \item \textbf{Substituted models.} Results characterize the substituted Qwen3.5
+        models, not the originally specified Meta/GGUF checkpoints.
+  \item \textbf{Emulated heads.} Look-ahead comes from a draft model, not the
+        target's native NEXTN heads (\S\ref{sec:why-draft}). Absolute speedups
+        differ from a fused MTP implementation; the \emph{direction} and the
+        accuracy trade-off are faithful.
+  \item \textbf{No KV cache.} Decode loops use full forward passes for clarity,
+        so absolute tokens/s is lower than production; \emph{relative} mode
+        comparisons remain valid.
+  \item \textbf{Small default \texttt{-{}-limit}.} Statistically meaningful
+        accuracy requires raising the example count.
+  \item \textbf{Code execution.} \texttt{-{}-allow-code-exec} runs
+        model-generated Python (subprocess + timeout). This is not a security
+        sandbox; run it only inside a container or VM.
+\end{itemize}
+
+% ===========================================================================
+\section{Future Work}
+% ===========================================================================
+\begin{itemize}[nosep]
+  \item Add a validated native-NEXTN proposer (self-checked by acceptance rate)
+        as a drop-in replacement for the draft model.
+  \item Cross-check the two verifiable modes against vLLM's
+        \texttt{qwen3\_next\_mtp} for trustworthy native-head throughput.
+  \item Add KV-cache decoding for realistic absolute throughput.
+  \item Sweep the block size $K$ to map the speedup/accuracy frontier of the
+        parallel mode.
+  \item Include a genuinely distinct second architecture (e.g.\ a DeepSeek/GLM
+        NEXTN model) to compare MTP designs, per the original brief.
+\end{itemize}
+
+% ===========================================================================
+\begin{thebibliography}{9}
+% ===========================================================================
+\bibitem{gloeckle2024} F.~Gloeckle, B.~Youbi Idrissi, B.~Rozi\`ere, D.~Lopez-Paz, G.~Synnaeve.
+``Better \& Faster Large Language Models via Multi-token Prediction.'' arXiv:2404.19737, 2024.
+
+\bibitem{leviathan2023} Y.~Leviathan, M.~Kalman, Y.~Matias.
+``Fast Inference from Transformers via Speculative Decoding.'' ICML, 2023.
+
+\bibitem{chen2023} C.~Chen et al.
+``Accelerating Large Language Model Decoding with Speculative Sampling.'' arXiv:2302.01318, 2023.
+
+\bibitem{deepseekv3} DeepSeek-AI.
+``DeepSeek-V3 Technical Report.'' arXiv:2412.19437, 2024. (Multi-token prediction / NEXTN module.)
+
+\bibitem{cai2024medusa} T.~Cai et al.
+``Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads.'' arXiv:2401.10774, 2024.
+
+\bibitem{cobbe2021} K.~Cobbe et al.
+``Training Verifiers to Solve Math Word Problems'' (GSM8K). arXiv:2110.14168, 2021.
+
+\bibitem{chen2021codex} M.~Chen et al.
+``Evaluating Large Language Models Trained on Code'' (HumanEval). arXiv:2107.03374, 2021.
+
+\bibitem{hendrycks2021} D.~Hendrycks et al.
+``Measuring Massive Multitask Language Understanding'' (MMLU). ICLR, 2021.
+
+\bibitem{clark2018arc} P.~Clark et al.
+``Think you have Solved Question Answering? Try ARC.'' arXiv:1803.05457, 2018.
+\end{thebibliography}
+
+\end{document}

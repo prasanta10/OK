@@ -23,24 +23,49 @@ from datasets import load_dataset
 # Prompt formatting shared helper
 # ---------------------------------------------------------------------------
 def build_chat_prompt(tokenizer, user_text: str) -> str:
-    """Use the model's chat template when it has one; else fall back to raw."""
+    """Use the model's chat template when it has one; else fall back to raw.
+
+    Qwen3.5 is a "thinking" model: by default the template opens a long
+    <think>...</think> chain-of-thought that easily exhausts the token budget
+    before the final answer. We disable it (`enable_thinking=False`) so the model
+    answers directly; the kwarg is ignored by templates that don't support it.
+    """
     if getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(
-            [{"role": "user", "content": user_text}],
-            tokenize=False, add_generation_prompt=True,
-        )
+        msgs = [{"role": "user", "content": user_text}]
+        try:
+            return tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False)
+        except TypeError:
+            return tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True)
     return user_text + "\n"
 
 
 # ---------------------------------------------------------------------------
 # GSM8K
 # ---------------------------------------------------------------------------
-_NUM_RE = re.compile(r"-?\d[\d,]*")
+_NUM_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def _strip_think(text: str) -> str:
+    """Remove a <think>...</think> reasoning block (and any unclosed leftover)."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return re.sub(r".*</think>", "", text, flags=re.DOTALL)
 
 
 def _last_number(text: str):
     nums = _NUM_RE.findall(text.replace(",", ""))
-    return nums[-1] if nums else None
+    return nums[-1].rstrip(".") if nums else None
+
+
+def _final_number(text: str):
+    """Prefer an explicit 'Answer: <n>'; otherwise the last number in the text."""
+    text = _strip_think(text)
+    m = re.search(r"[Aa]nswer\s*[:\-]?\s*\$?(-?\d[\d,]*(?:\.\d+)?)", text)
+    if m:
+        return m.group(1).replace(",", "").rstrip(".")
+    return _last_number(text)
 
 
 class GSM8K:
@@ -61,7 +86,7 @@ class GSM8K:
         return out
 
     def score(self, ex, gen):
-        pred = _last_number(gen)
+        pred = _final_number(gen)
         gold = _last_number(ex["gold"])
         return float(pred is not None and gold is not None and pred == gold)
 
@@ -135,6 +160,7 @@ _LETTER_RE = re.compile(r"\b([A-D])\b")
 
 def _extract_letter(text: str):
     # Prefer an explicit "Answer: X"; otherwise take the last standalone letter.
+    text = _strip_think(text)
     m = re.search(r"[Aa]nswer\s*[:\-]?\s*([A-D])", text)
     if m:
         return m.group(1)

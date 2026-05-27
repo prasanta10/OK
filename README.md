@@ -29,8 +29,10 @@ conda activate mtp-bench
 huggingface-cli login          # needed if any chosen repo is gated
 ```
 
-If `nvidia-smi` shows a CUDA version other than 12.4, edit the `cu124` index URL
-in [environment.yml](environment.yml).
+Built for CUDA 13.0 (`cu130`, needs torch ≥ 2.10). If `nvidia-smi` shows a
+different CUDA version, edit the `cu130` index URL in
+[environment.yml](environment.yml) (CUDA drivers are backward-compatible, so a
+13.0 driver also runs older `cu128`/`cu126` wheels).
 
 ## Run
 

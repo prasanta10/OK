@@ -7,8 +7,10 @@
 # Notes:
 # - We let conda manage Python + CUDA runtime, then pip-install the ML stack so
 #   we get the official CUDA wheels for PyTorch (more reliable than conda-forge).
-# - Adjust the torch CUDA index URL (cu124) below if your driver needs a
-#   different CUDA version: run `nvidia-smi` and pick a matching build.
+# - Built for CUDA 13.0 (cu130). `nvidia-smi` reporting "CUDA Version: 13.0" means
+#   your driver supports up to 13.0; it is also backward-compatible, so cu128/cu126
+#   wheels would run too. Use --extra-index-url (NOT --index-url): the cu130 index
+#   is missing a cuda-bindings dep and --index-url installs break on it.
 name: mtp-bench
 channels:
   - conda-forge
@@ -17,9 +19,9 @@ dependencies:
   - pip
   - git            # needed to pip-install human-eval from source
   - pip:
-      # --- PyTorch (CUDA 12.4 build). Change cu124 if your driver differs. ---
-      - --extra-index-url https://download.pytorch.org/whl/cu124
-      - torch>=2.4
+      # --- PyTorch (CUDA 13.0 build). cu130 wheels require torch >= 2.10. ---
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch>=2.10
       # --- Hugging Face stack ---
       - transformers>=4.44
       - accelerate>=0.33

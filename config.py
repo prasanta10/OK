@@ -34,12 +34,12 @@ MODELS = [
     ModelSpec(
         name="Qwen3.5-9B",
         repo="Qwen/Qwen3.5-9B",
-        draft_repo="Qwen/Qwen3.5-0.6B",
+        draft_repo="Qwen/Qwen3.5-0.8B",
     ),
     ModelSpec(
         name="Qwen3.5-4B",
         repo="Qwen/Qwen3.5-4B",
-        draft_repo="Qwen/Qwen3.5-0.6B",
+        draft_repo="Qwen/Qwen3.5-0.8B",
     ),
 ]
 
@@ -73,10 +73,10 @@ class TaskSpec:
 
 
 TASKS = [
-    TaskSpec("gsm8k",     "gsm8k",          "main",       "test"),
-    TaskSpec("humaneval", "openai_humaneval", "openai_humaneval", "test"),
-    TaskSpec("mmlu",      "cais/mmlu",      "all",        "test"),
-    TaskSpec("arc",       "allenai/ai2_arc", "ARC-Challenge", "test"),
+    TaskSpec("gsm8k",     "openai/gsm8k",          "main",       "test"),
+    TaskSpec("humaneval", "openai/openai_humaneval", "openai_humaneval", "test"),
+    TaskSpec("mmlu",      "cais/mmlu",             "all",        "test"),
+    TaskSpec("arc",       "allenai/ai2_arc",       "ARC-Challenge", "test"),
 ]
 
 
@@ -92,6 +92,7 @@ class RunConfig:
     device: str = "cuda"
     seed: int = 0
     allow_code_exec: bool = False   # HumanEval executes model output -> opt-in only
+    debug: bool = False             # print first prompt+generation per cell
     results_dir: str = "results"
     models: list = field(default_factory=lambda: MODELS)
     tasks: list = field(default_factory=lambda: TASKS)
