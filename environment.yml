@@ -1,0 +1,35 @@
+# Conda environment for the MTP decoding benchmark.
+#
+# Create it with:
+#     conda env create -f environment.yml
+#     conda activate mtp-bench
+#
+# Notes:
+# - We let conda manage Python + CUDA runtime, then pip-install the ML stack so
+#   we get the official CUDA wheels for PyTorch (more reliable than conda-forge).
+# - Adjust the torch CUDA index URL (cu124) below if your driver needs a
+#   different CUDA version: run `nvidia-smi` and pick a matching build.
+name: mtp-bench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - git            # needed to pip-install human-eval from source
+  - pip:
+      # --- PyTorch (CUDA 12.4 build). Change cu124 if your driver differs. ---
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch>=2.4
+      # --- Hugging Face stack ---
+      - transformers>=4.44
+      - accelerate>=0.33
+      - datasets>=2.20
+      - huggingface_hub>=0.24
+      - sentencepiece
+      - safetensors
+      # --- utilities ---
+      - numpy
+      - tqdm
+      - tabulate          # pretty result tables
+      # --- HumanEval execution harness (optional, only for the coding task) ---
+      - human-eval
