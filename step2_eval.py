@@ -10,6 +10,7 @@ and will be the same script we extend for Mode B.
 
 Usage:
     python step2_eval.py --mode a          # Standard AR
+    python step2_eval.py --mode b          # MTP WITHOUT verification (Mode B)
     python step2_eval.py --mode c          # MTP with verification
     python step2_eval.py --limit 50        # Run more samples
     python step2_eval.py --mode a --all    # Run full test set (1319 samples)
@@ -97,7 +98,17 @@ def extract_gold_answer(answer_text):
 # 3. MAIN EVALUATION LOOP
 # ===================================================================
 
-def run_evaluation(mode, limit):
+def run_evaluation(mode_key, limit):
+    """
+    Run GSM8K evaluation with given mode.
+    mode_key: "a", "b", or "c"
+    """
+    mode_names = {
+        "a": "Mode A — Standard AR",
+        "b": "Mode B — MTP No Verify",
+        "c": "Mode C — MTP + Verify",
+    }
+    mode = mode_names[mode_key]
     # --- Load dataset ---
     print("Loading GSM8K dataset...")
     dataset = load_dataset("openai/gsm8k", "main")
@@ -134,12 +145,18 @@ def run_evaluation(mode, limit):
         "gpu_memory_utilization": 0.9,
     }
 
-    if mode == "c":
+    if mode_key == "c" or mode_key == "b":
         llm_kwargs["speculative_config"] = {
             "method": "mtp",
             "num_speculative_tokens": 1,
         }
-    # Mode B will be added in Step 3
+
+    # MODE B: Tell vLLM's rejection sampler to skip verification.
+    # This env var is read inside our modified rejection_sampler.py.
+    if mode_key == "b":
+        os.environ["VLLM_SKIP_VERIFICATION"] = "1"
+    else:
+        os.environ.pop("VLLM_SKIP_VERIFICATION", None)
 
     llm = LLM(**llm_kwargs)
 
@@ -209,7 +226,7 @@ def run_evaluation(mode, limit):
     print(f"{'=' * 60}")
 
     # --- Save results ---
-    output_dir = f"results/mode_{mode[-1]}"
+    output_dir = f"results/mode_{mode_key}"
     os.makedirs(output_dir, exist_ok=True)
 
     summary = {
@@ -248,10 +265,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     limit = None if args.all else args.limit
-
-    mode_names = {
-        "a": "Mode A — Standard AR",
-        "c": "Mode C — MTP + Verify",
-    }
-
-    run_evaluation(mode_names[args.mode], limit)
+    run_evaluation(args.mode, limit)
